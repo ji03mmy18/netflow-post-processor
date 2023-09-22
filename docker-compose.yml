@@ -1,0 +1,41 @@
+version: '3'
+
+services:
+  nfcapd:
+    build: ./nfcapd/
+    image: nfcapd:alpine-3.18
+    restart: always
+    volumes:
+      - flow-volume:/data/netflow 
+  db:
+    image: postgres:16
+    restart: always
+    environment:
+      - POSTGRES_USER=
+      - POSTGRES_PASSWORD=
+      - POSTGRES_DB=
+      - TZ=Asia/Taipei
+    ports:
+      - "5432:5432"
+  app:
+    build: .
+    restart: always
+    environment:
+      - DB_USER=
+      - DB_PASSWD=
+      - DB_HOST=
+      - DB_PORT=
+      - DB_NAME=
+      - TZ=Asia/Taipei
+    volumes:
+      - flow-volume:/data/netflow
+    depends_on:
+      - nfcapd
+      - db
+
+volumes:
+  flow-volume:
+    driver_opts:
+      type: none
+      device: ${PWD}/data
+      o: bind

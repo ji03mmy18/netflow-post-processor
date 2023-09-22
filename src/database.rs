@@ -1,0 +1,133 @@
+use std::net::Ipv4Addr;
+
+use chrono::{NaiveDateTime, FixedOffset, Datelike, NaiveDate};
+use postgres::NoTls;
+use postgres_inet::MaskedIpAddr;
+use r2d2::{Pool, PooledConnection};
+use r2d2_postgres::PostgresConnectionManager;
+use uuid::Uuid;
+
+use crate::netflow::NetflowV4;
+
+pub fn store_data(flow: NetflowV4, flow_type: u8, pool: &Pool<PostgresConnectionManager<NoTls>>) {
+    let naive_dt = NaiveDateTime::parse_from_str(&flow.first, "%Y-%m-%dT%H:%M:%S.%3f")
+        .expect("DateTime Parse error!");
+    let tz = FixedOffset::east_opt(8 * 3600).expect("TimeZone Parse error!");
+    let dt = naive_dt.and_local_timezone(tz).unwrap();
+    
+    let date = dt.naive_local().date();
+    let hour: i16 = dt.format("%H").to_string().parse().unwrap();
+    let bytes = i64::try_from(flow.in_bytes).expect("i64 Parse error: size not enough!");
+    let nf_name = format!("nf_{}", dt.format("%Y_%m").to_string());
+
+    let src_ip_v4: Ipv4Addr = flow.src4_addr.parse().expect("IP invalid or parser not working!");
+    let dst_ip_v4: Ipv4Addr = flow.dst4_addr.parse().expect("IP invalid or parser not working!");
+    let mask_src: MaskedIpAddr = From::from(src_ip_v4);
+    let mask_dst: MaskedIpAddr = From::from(dst_ip_v4);
+
+    match flow_type {
+        1 => {
+            let ip_ref = get_ip_ref(mask_dst, pool.get().unwrap());
+            let nf_id = get_nf_id(ip_ref, &date, &hour, &nf_name, pool.get().unwrap());
+            update_extra_in(nf_id, &nf_name, bytes, pool.get().unwrap());
+        },
+        2 => {
+            let ip_ref = get_ip_ref(mask_src, pool.get().unwrap());
+            let nf_id = get_nf_id(ip_ref, &date, &hour, &nf_name, pool.get().unwrap());
+            update_extra_out(nf_id, &nf_name, bytes, pool.get().unwrap());
+        },
+        3 => {
+            let src_ref = get_ip_ref(mask_src, pool.get().unwrap());
+            let dst_ref = get_ip_ref(mask_dst, pool.get().unwrap());
+            let src_id = get_nf_id(src_ref, &date, &hour, &nf_name, pool.get().unwrap());
+            let dst_id = get_nf_id(dst_ref, &date, &hour, &nf_name, pool.get().unwrap());
+            update_intra(src_id, dst_id, &nf_name, bytes, pool.get().unwrap());
+        },
+        _ => () //println!("Flow Skip...")
+    };
+}
+
+fn get_ip_ref(ip_addr: MaskedIpAddr, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) -> Uuid {
+    let mut rows = client.query("SELECT id FROM ipset WHERE ip_addr = $1;", &[&ip_addr])
+        .expect("DB Query failed: select ip from ipset");
+    if rows.len() == 0 {
+        client.execute("INSERT INTO ipset (ip_addr) VALUES ($1);", &[&ip_addr]).unwrap();
+        rows = client.query("SELECT id FROM ipset WHERE ip_addr = $1;", &[&ip_addr])
+            .expect("DB Query failed: select ip from ipset");
+    }
+    return rows[0].get(0);
+}
+
+fn get_nf_id(ip_ref: Uuid, date: &NaiveDate, time: &i16, nf_name: &String, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) -> Uuid {
+    let mut rows = client.query(&format!("SELECT id FROM {nf_name} WHERE ip_ref = $1 AND date = $2 AND time = $3;"), &[&ip_ref, &date, &time])
+        .expect("DB Query failed: select nf from nf table");
+    if rows.len() == 0 {
+        client.execute(&format!("INSERT INTO {nf_name} (ip_ref, date, time) VALUES ($1, $2, $3);"), &[&ip_ref, &date, &time]).unwrap();
+        rows = client.query(&format!("SELECT id FROM {nf_name} WHERE ip_ref = $1 AND date = $2 AND time = $3;"), &[&ip_ref, &date, &time])
+            .expect("DB Query failed: select nf from nf table");
+    }
+    return rows[0].get(0);
+}
+
+fn update_extra_in(nf_id: Uuid, nf_name: &String, bytes: i64, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
+    client.execute(&format!("UPDATE {nf_name} SET extra_in = extra_in + $1 WHERE id = $2;"), &[&bytes, &nf_id]).unwrap();
+}
+
+fn update_extra_out(nf_id: Uuid, nf_name: &String, bytes: i64, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
+    client.execute(&format!("UPDATE {nf_name} SET extra_out = extra_out + $1 WHERE id = $2;"), &[&bytes, &nf_id]).unwrap();
+}
+
+fn update_intra(src_id: Uuid, dst_id: Uuid, nf_name: &String, bytes: i64, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
+    client.execute(&format!("UPDATE {nf_name} SET intra_in  = intra_in  + $1 WHERE id = $2;"), &[&bytes, &dst_id]).unwrap();
+    client.execute(&format!("UPDATE {nf_name} SET intra_out = intra_out + $1 WHERE id = $2;"), &[&bytes, &src_id]).unwrap();
+}
+
+pub fn init_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
+    let mut client = pool.get().unwrap();
+    let rows = client.query("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ipset';", &[])
+        .expect("DB Query error: select current month nf table");
+    let exist: i64 = rows[0].get(0);
+    if exist == 0 {
+        client.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";", &[]).unwrap();
+        client.execute("COMMENT ON EXTENSION \"uuid-ossp\" IS 
+            'generate universally unique identifiers (UUIDs)';", &[]).unwrap();
+        client.execute("CREATE TABLE ipset (
+            id uuid DEFAULT uuid_generate_v4() NOT NULL,
+            ip_addr inet NOT NULL,
+            total bigint DEFAULT 0,
+            PRIMARY KEY (id));",
+            &[]).unwrap();
+    }
+}
+
+pub fn check_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
+    let dt = chrono::offset::Local::now();
+    let mut client = pool.get().unwrap();
+    let curr_year = dt.year();
+    let next_year = if dt.month() == 12 { dt.year() + 1 } else { dt.year() };
+    let curr_month = dt.month();
+    let next_month = if dt.month() == 12 { 1 } else { dt.month() + 1 };
+    let nf_name: [String; 2] = [format!("nf_{}_{:0>2}", curr_year, curr_month), format!("nf_{}_{:0>2}", next_year, next_month)];
+    
+    for nftable in nf_name {
+        let rows = client.query("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = $1;", &[&nftable])
+            .expect("DB Query error: select current month nf table");
+        let exist: i64 = rows[0].get(0);
+        println!("Table Exist: {} => {}", nftable, exist);
+        if exist == 0 {
+            client.execute(&format!("CREATE TABLE {nftable} (
+                id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
+                ip_ref uuid NOT NULL,
+                date date DEFAULT CURRENT_DATE NOT NULL,
+                \"time\" smallint NOT NULL,
+                intra_in bigint DEFAULT 0,
+                intra_out bigint DEFAULT 0,
+                extra_in bigint DEFAULT 0,
+                extra_out bigint DEFAULT 0,
+                CONSTRAINT valid_hours CHECK (((\"time\" >= 0) AND (\"time\" <= 23))),
+                CONSTRAINT fk_ip_ref FOREIGN KEY (ip_ref) REFERENCES public.ipset(id),
+                PRIMARY KEY (id));"),
+                &[]).unwrap();
+        }
+    }
+}
