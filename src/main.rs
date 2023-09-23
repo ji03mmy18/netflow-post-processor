@@ -1,15 +1,25 @@
-use std::{thread::sleep, fs::read_dir, time::Duration, env};
+use std::{
+    thread::sleep,
+    fs::read_dir,
+    time::Duration,
+    collections::HashMap,
+    env
+};
 
 use chrono::Local;
 use clokwerk::{Scheduler, TimeUnits, Interval::Sunday, Job};
-use database::{check_dbtable, store_data};
+use database::{
+    FlowCount,
+    check_dbtable,
+    init_dbtable,
+    store_cache,
+    cache_date
+};
 use netflow::NetflowV4;
 use postgres::{Config, NoTls};
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
 use regex::Regex;
-
-use crate::database::init_dbtable;
 
 mod netflow;
 mod database;
@@ -41,12 +51,16 @@ fn processing(pool: &Pool<PostgresConnectionManager<NoTls>>) {
     let flows = netflow::parse_data(file_list);
     println!("\nFlow Count: {}", flows.len());
 
+    let mut cache: HashMap<String, FlowCount> = HashMap::new();
+
     println!("Store Start!");
     println!("Time => {}", Local::now().format("%H:%M:%S"));
     for flow in flows {
         let flow_type = get_netflow_type(&flow);
-        store_data(flow, flow_type, pool);
+        cache_date(flow, flow_type, &mut cache);
     }
+    println!("Cache Done: ip count => {}", cache.len());
+    store_cache(cache, pool);
     println!("Store Finish!");
     println!("Time => {}", Local::now().format("%H:%M:%S"));
     //刪除處理完成的檔案

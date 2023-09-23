@@ -1,6 +1,6 @@
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, collections::HashMap};
 
-use chrono::{NaiveDateTime, FixedOffset, Datelike, NaiveDate};
+use chrono::{Datelike, NaiveDate};
 use postgres::NoTls;
 use postgres_inet::MaskedIpAddr;
 use r2d2::{Pool, PooledConnection};
@@ -9,42 +9,58 @@ use uuid::Uuid;
 
 use crate::netflow::NetflowV4;
 
-pub fn store_data(flow: NetflowV4, flow_type: u8, pool: &Pool<PostgresConnectionManager<NoTls>>) {
-    let naive_dt = NaiveDateTime::parse_from_str(&flow.first, "%Y-%m-%dT%H:%M:%S.%3f")
-        .expect("DateTime Parse error!");
-    let tz = FixedOffset::east_opt(8 * 3600).expect("TimeZone Parse error!");
-    let dt = naive_dt.and_local_timezone(tz).unwrap();
-    
-    let date = dt.naive_local().date();
-    let hour: i16 = dt.format("%H").to_string().parse().unwrap();
+pub struct FlowCount {
+    extra_in: i64,
+    extra_out: i64,
+    intra_in: i64,
+    intra_out: i64
+}
+
+impl Default for FlowCount {
+    fn default() -> Self {
+        Self { extra_in: 0, extra_out: 0, intra_in: 0, intra_out: 0 }
+    }
+}
+
+pub fn cache_date(flow: NetflowV4, flow_type: u8, cache: &mut HashMap<String, FlowCount>) {
+    let date: Vec<&str> = flow.first.split('T').collect();
+    let hour: Vec<&str> = date[1].split(":").collect();
     let bytes = i64::try_from(flow.in_bytes).expect("i64 Parse error: size not enough!");
-    let nf_name = format!("nf_{}", dt.format("%Y_%m").to_string());
-
-    let src_ip_v4: Ipv4Addr = flow.src4_addr.parse().expect("IP invalid or parser not working!");
-    let dst_ip_v4: Ipv4Addr = flow.dst4_addr.parse().expect("IP invalid or parser not working!");
-    let mask_src: MaskedIpAddr = From::from(src_ip_v4);
-    let mask_dst: MaskedIpAddr = From::from(dst_ip_v4);
-
     match flow_type {
         1 => {
-            let ip_ref = get_ip_ref(mask_dst, pool.get().unwrap());
-            let nf_id = get_nf_id(ip_ref, &date, &hour, &nf_name, pool.get().unwrap());
-            update_extra_in(nf_id, &nf_name, bytes, pool.get().unwrap());
+            let record = cache.entry(format!("{}_{}_{}",flow.dst4_addr, date[0], hour[0]))
+                .or_insert(FlowCount { ..Default::default() });
+            record.extra_in += bytes;
         },
         2 => {
-            let ip_ref = get_ip_ref(mask_src, pool.get().unwrap());
-            let nf_id = get_nf_id(ip_ref, &date, &hour, &nf_name, pool.get().unwrap());
-            update_extra_out(nf_id, &nf_name, bytes, pool.get().unwrap());
+            let record = cache.entry(format!("{}_{}_{}",flow.src4_addr, date[0], hour[0]))
+                .or_insert(FlowCount { ..Default::default() });
+            record.extra_out += bytes;
         },
         3 => {
-            let src_ref = get_ip_ref(mask_src, pool.get().unwrap());
-            let dst_ref = get_ip_ref(mask_dst, pool.get().unwrap());
-            let src_id = get_nf_id(src_ref, &date, &hour, &nf_name, pool.get().unwrap());
-            let dst_id = get_nf_id(dst_ref, &date, &hour, &nf_name, pool.get().unwrap());
-            update_intra(src_id, dst_id, &nf_name, bytes, pool.get().unwrap());
+            let record = cache.entry(format!("{}_{}_{}",flow.dst4_addr, date[0], hour[0]))
+                .or_insert(FlowCount { ..Default::default() });
+            record.intra_in += bytes;
+            let record = cache.entry(format!("{}_{}_{}",flow.src4_addr, date[0], hour[0]))
+                .or_insert(FlowCount { ..Default::default() });
+            record.intra_out += bytes;
         },
-        _ => () //println!("Flow Skip...")
-    };
+        _ => ()
+    }
+}
+
+pub fn store_cache(cache: HashMap<String, FlowCount>, pool: &Pool<PostgresConnectionManager<NoTls>>) {
+    for (key, flow) in cache {
+        let keys: Vec<&str> = key.split("_").collect();
+        let ip = keys[0].to_string();
+        let date = NaiveDate::parse_from_str(keys[1], "%Y-%m-%d").expect("NaiveDate Parse error: ");
+        let hour: i16 = keys[2].parse().unwrap();
+
+        let nf_name = format!("nf_{}", date.format("%Y_%m").to_string());
+        let ip_ref = get_ip_ref(From::from(ip.parse::<Ipv4Addr>().expect("msg")), pool.get().unwrap());
+        let nf_id = get_nf_id(ip_ref, &date, &hour, &nf_name, pool.get().unwrap());
+        update_flow(nf_id, &nf_name, flow, pool.get().unwrap());
+    }
 }
 
 fn get_ip_ref(ip_addr: MaskedIpAddr, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) -> Uuid {
@@ -69,17 +85,10 @@ fn get_nf_id(ip_ref: Uuid, date: &NaiveDate, time: &i16, nf_name: &String, mut c
     return rows[0].get(0);
 }
 
-fn update_extra_in(nf_id: Uuid, nf_name: &String, bytes: i64, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
-    client.execute(&format!("UPDATE {nf_name} SET extra_in = extra_in + $1 WHERE id = $2;"), &[&bytes, &nf_id]).unwrap();
-}
-
-fn update_extra_out(nf_id: Uuid, nf_name: &String, bytes: i64, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
-    client.execute(&format!("UPDATE {nf_name} SET extra_out = extra_out + $1 WHERE id = $2;"), &[&bytes, &nf_id]).unwrap();
-}
-
-fn update_intra(src_id: Uuid, dst_id: Uuid, nf_name: &String, bytes: i64, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
-    client.execute(&format!("UPDATE {nf_name} SET intra_in  = intra_in  + $1 WHERE id = $2;"), &[&bytes, &dst_id]).unwrap();
-    client.execute(&format!("UPDATE {nf_name} SET intra_out = intra_out + $1 WHERE id = $2;"), &[&bytes, &src_id]).unwrap();
+fn update_flow(nf_id: Uuid, nf_name: &String, flow: FlowCount, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
+    client.execute(&format!("UPDATE {nf_name} SET extra_in = extra_in + $1, extra_out = extra_out + $2,
+        intra_in = intra_in + $3, intra_out = intra_out + $4 WHERE id = $5;"),
+        &[&flow.extra_in, &flow.extra_out, &flow.intra_in, &flow.intra_out, &nf_id]).unwrap();
 }
 
 pub fn init_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
