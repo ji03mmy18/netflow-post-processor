@@ -6,7 +6,7 @@ services:
     image: nfcapd:alpine-3.18
     restart: always
     volumes:
-      - flow-volume:/data/netflow 
+      - flow-volume:/data/netflow
   db:
     image: postgres:16
     restart: always
@@ -26,6 +26,7 @@ services:
       - DB_HOST=
       - DB_PORT=
       - DB_NAME=
+      - THREAD=
       - TZ=Asia/Taipei
     volumes:
       - flow-volume:/data/netflow

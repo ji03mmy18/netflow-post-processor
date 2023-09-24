@@ -8,17 +8,18 @@ use std::{
 
 use chrono::Local;
 use clokwerk::{Scheduler, TimeUnits, Interval::Sunday, Job};
-use database::{
-    FlowCount,
-    check_dbtable,
-    store_cache,
-    cache_date
-};
 use netflow::NetflowV4;
 use postgres::{Config, NoTls};
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
 use regex::Regex;
+
+use crate::database::{
+    cache_data_mt,
+    store_cache_mt,
+    check_dbtable,
+    FlowCount
+};
 
 mod netflow;
 mod database;
@@ -44,21 +45,29 @@ fn main() {
 }
 
 fn processing(pool: &Pool<PostgresConnectionManager<NoTls>>) {
+    println!("\nProcess Start!");
+    println!("Time => {}", Local::now().format("%H:%M:%S"));
+    //取得檔案列表
     let file_list = get_all_netflow_file();
     
+    //轉換為NetflowV4物件
     let flows = netflow::parse_data(file_list);
-    println!("\nFlow Count: {}", flows.len());
+    println!("Flow Count: {}", flows.len());
 
-    let mut cache: HashMap<String, FlowCount> = HashMap::new();
+    //建立流量快取，ip_date_hour為Key, 流量為Value
+    let mut cache: Vec<HashMap<String, FlowCount>> = Vec::new();
 
     println!("Store Start!");
     println!("Time => {}", Local::now().format("%H:%M:%S"));
-    for flow in flows {
-        let flow_type = get_netflow_type(&flow);
-        cache_date(flow, flow_type, &mut cache);
+    //執行快取運算
+    let threads: usize = env::var("THREAD").expect("THREAD not found!").parse()
+        .expect("THREAD Parse error!");
+    cache_data_mt(threads, flows, &mut cache);
+    println!("Cache Done: ip count => {}", cache.iter().map(|hm| hm.len()).sum::<usize>());
+    //儲存快取到DB
+    for c in cache{
+        store_cache_mt(c, pool);
     }
-    println!("Cache Done: ip count => {}", cache.len());
-    store_cache(cache, pool);
     println!("Store Finish!");
     println!("Time => {}", Local::now().format("%H:%M:%S"));
     //刪除處理完成的檔案
@@ -66,8 +75,7 @@ fn processing(pool: &Pool<PostgresConnectionManager<NoTls>>) {
 
 fn get_all_netflow_file() -> Vec<String> {
     let folder_path = "/data/netflow";
-    //let folder_path = "/home/jolly/Rust/netflow-post-processor/data";
-
+    
     if let Ok(files) = read_dir(folder_path) {
         let mut filenames: Vec<String> = Vec::new();
         let re = Regex::new(r"nfcapd\.\d{12}").unwrap();

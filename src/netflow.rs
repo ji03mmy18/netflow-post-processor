@@ -39,7 +39,7 @@ pub struct Netflow {
 }
  */
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetflowV4 {
     pub first: String,
     pub last: String,
@@ -49,7 +49,7 @@ pub struct NetflowV4 {
     pub dst4_addr: String,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetflowV6 {
     pub first: String,
     pub last: String,
@@ -66,7 +66,6 @@ pub fn parse_data(file_list: Vec<String>) -> Vec<NetflowV4> {
 
     for file in file_list {
         full_file_name.push("/data/netflow/".to_string() + &file);
-        //full_file_name.push("/home/jolly/Rust/netflow-post-processor/data/".to_string() + &file);
     }
 
     for file_path in full_file_name {

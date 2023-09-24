@@ -102,3 +102,18 @@ pub fn check_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
         }
     }
 }
+
+pub fn store_cache(cache: HashMap<String, FlowCount>, pool: &Pool<PostgresConnectionManager<NoTls>>) {
+    let mut client = pool.get().unwrap();
+    let mut transaction = client.transaction().expect("Create Transaction Error: ");
+    for (key, flow) in cache {
+        let keys: Vec<&str> = key.split("_").collect();
+        let ip: MaskedIpAddr = From::from(keys[0].parse::<Ipv4Addr>().expect("msg"));
+        let date = NaiveDate::parse_from_str(keys[1], "%Y-%m-%d").expect("NaiveDate Parse error: ");
+        let hour: i16 = keys[2].parse().unwrap();
+
+        let nf_name = format!("nf_{}", date.format("%Y_%m").to_string());
+        update_flow(&nf_name, &ip, &date, &hour, &flow, &mut transaction);
+    }
+    transaction.commit().expect("Commit Error: ");
+}
