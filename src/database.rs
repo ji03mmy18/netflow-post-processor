@@ -5,7 +5,6 @@ use postgres::NoTls;
 use postgres_inet::MaskedIpAddr;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
-use uuid::Uuid;
 
 use crate::netflow::NetflowV4;
 
@@ -52,61 +51,25 @@ pub fn cache_date(flow: NetflowV4, flow_type: u8, cache: &mut HashMap<String, Fl
 pub fn store_cache(cache: HashMap<String, FlowCount>, pool: &Pool<PostgresConnectionManager<NoTls>>) {
     for (key, flow) in cache {
         let keys: Vec<&str> = key.split("_").collect();
-        let ip = keys[0].to_string();
+        let ip: MaskedIpAddr = From::from(keys[0].parse::<Ipv4Addr>().expect("msg"));
         let date = NaiveDate::parse_from_str(keys[1], "%Y-%m-%d").expect("NaiveDate Parse error: ");
         let hour: i16 = keys[2].parse().unwrap();
 
         let nf_name = format!("nf_{}", date.format("%Y_%m").to_string());
-        let ip_ref = get_ip_ref(From::from(ip.parse::<Ipv4Addr>().expect("msg")), pool.get().unwrap());
-        let nf_id = get_nf_id(ip_ref, &date, &hour, &nf_name, pool.get().unwrap());
-        update_flow(nf_id, &nf_name, flow, pool.get().unwrap());
+        update_flow(nf_name, ip, date, hour, flow, pool.get().unwrap());
     }
 }
 
-fn get_ip_ref(ip_addr: MaskedIpAddr, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) -> Uuid {
-    let mut rows = client.query("SELECT id FROM ipset WHERE ip_addr = $1;", &[&ip_addr])
-        .expect("DB Query failed: select ip from ipset");
-    if rows.len() == 0 {
-        client.execute("INSERT INTO ipset (ip_addr) VALUES ($1);", &[&ip_addr]).unwrap();
-        rows = client.query("SELECT id FROM ipset WHERE ip_addr = $1;", &[&ip_addr])
-            .expect("DB Query failed: select ip from ipset");
-    }
-    return rows[0].get(0);
-}
-
-fn get_nf_id(ip_ref: Uuid, date: &NaiveDate, time: &i16, nf_name: &String, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) -> Uuid {
-    let mut rows = client.query(&format!("SELECT id FROM {nf_name} WHERE ip_ref = $1 AND date = $2 AND time = $3;"), &[&ip_ref, &date, &time])
-        .expect("DB Query failed: select nf from nf table");
-    if rows.len() == 0 {
-        client.execute(&format!("INSERT INTO {nf_name} (ip_ref, date, time) VALUES ($1, $2, $3);"), &[&ip_ref, &date, &time]).unwrap();
-        rows = client.query(&format!("SELECT id FROM {nf_name} WHERE ip_ref = $1 AND date = $2 AND time = $3;"), &[&ip_ref, &date, &time])
-            .expect("DB Query failed: select nf from nf table");
-    }
-    return rows[0].get(0);
-}
-
-fn update_flow(nf_id: Uuid, nf_name: &String, flow: FlowCount, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
-    client.execute(&format!("UPDATE {nf_name} SET extra_in = extra_in + $1, extra_out = extra_out + $2,
-        intra_in = intra_in + $3, intra_out = intra_out + $4 WHERE id = $5;"),
-        &[&flow.extra_in, &flow.extra_out, &flow.intra_in, &flow.intra_out, &nf_id]).unwrap();
-}
-
-pub fn init_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
-    let mut client = pool.get().unwrap();
-    let rows = client.query("SELECT COUNT(*) FROM information_schema.tables WHERE table_name = 'ipset';", &[])
-        .expect("DB Query error: select current month nf table");
-    let exist: i64 = rows[0].get(0);
-    if exist == 0 {
-        client.execute("CREATE EXTENSION IF NOT EXISTS \"uuid-ossp\";", &[]).unwrap();
-        client.execute("COMMENT ON EXTENSION \"uuid-ossp\" IS 
-            'generate universally unique identifiers (UUIDs)';", &[]).unwrap();
-        client.execute("CREATE TABLE ipset (
-            id uuid DEFAULT uuid_generate_v4() NOT NULL,
-            ip_addr inet NOT NULL,
-            total bigint DEFAULT 0,
-            PRIMARY KEY (id));",
-            &[]).unwrap();
-    }
+fn update_flow(nf_name: String, ip: MaskedIpAddr, date: NaiveDate, hour: i16, flow: FlowCount, mut client: PooledConnection<PostgresConnectionManager<NoTls>>) {
+    client.execute(&format!("INSERT INTO {nf_name} (ip, date, hour, intra_in, intra_out, extra_in, extra_out)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (ip, date, hour)
+        DO UPDATE SET
+            intra_in = {nf_name}.intra_in + EXCLUDED.intra_in,
+            intra_out = {nf_name}.intra_out + EXCLUDED.intra_out,
+            extra_in = {nf_name}.extra_in + EXCLUDED.extra_in,
+            extra_out = {nf_name}.extra_out + EXCLUDED.extra_out;"),
+        &[&ip, &date, &hour, &flow.intra_in, &flow.intra_out, &flow.extra_in, &flow.extra_out]).unwrap();
 }
 
 pub fn check_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
@@ -125,17 +88,16 @@ pub fn check_dbtable(pool: &Pool<PostgresConnectionManager<NoTls>>) {
         println!("Table Exist: {} => {}", nftable, exist);
         if exist == 0 {
             client.execute(&format!("CREATE TABLE {nftable} (
-                id uuid DEFAULT public.uuid_generate_v4() NOT NULL,
-                ip_ref uuid NOT NULL,
-                date date DEFAULT CURRENT_DATE NOT NULL,
-                \"time\" smallint NOT NULL,
+                ip inet NOT NULL,
+                date date NOT NULL,
+                hour smallint NOT NULL,
                 intra_in bigint DEFAULT 0,
                 intra_out bigint DEFAULT 0,
                 extra_in bigint DEFAULT 0,
                 extra_out bigint DEFAULT 0,
-                CONSTRAINT valid_hours CHECK (((\"time\" >= 0) AND (\"time\" <= 23))),
-                CONSTRAINT fk_ip_ref FOREIGN KEY (ip_ref) REFERENCES public.ipset(id),
-                PRIMARY KEY (id));"),
+                CONSTRAINT valid_hours CHECK ((hour >= 0) AND (hour <= 23)),
+                CONSTRAINT valid_ip CHECK (ip << '140.125.0.0/16'::inet),
+                PRIMARY KEY (ip, date, hour));"),
                 &[]).unwrap();
         }
     }

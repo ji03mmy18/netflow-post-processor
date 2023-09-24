@@ -11,7 +11,6 @@ use clokwerk::{Scheduler, TimeUnits, Interval::Sunday, Job};
 use database::{
     FlowCount,
     check_dbtable,
-    init_dbtable,
     store_cache,
     cache_date
 };
@@ -31,7 +30,6 @@ fn main() {
     let fork2 = pool.clone();
     let fork3 = pool.clone();
     println!("DB Pool Created!");
-    init_dbtable(&fork3);
     check_dbtable(&fork3);
 
     let mut scheduler = Scheduler::new();
